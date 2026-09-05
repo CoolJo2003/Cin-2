@@ -488,7 +488,7 @@
 
     <div class="seat seat-right" id="seatGuest">
       <div class="avatar-bubble" id="avatarGuest">
-        <video id="camGuestVideo" autoplay playsinline></video>
+        <video id="camGuestVideo" autoplay playsinline muted></video>
         <span class="avatar-fallback">👤</span>
       </div>
       <div class="seat-illustration"></div>
@@ -537,13 +537,24 @@ let isHost = false;
 let roomCode = null;
 let hasJoinedOrCreated = false; // guards against double create/join clicks
 
-// transceiver order agreed in advance: 0 = screen video, 1 = cam video, 2 = mic audio
-const T_SCREEN = 0, T_CAM = 1, T_MIC = 2;
+// 4 transceivers negotiated in this fixed order: screen video, cam video,
+// mic audio, screen audio. We look them up by their negotiated `mid`
+// (assigned by the browser from SDP m-line order) rather than by raw array
+// position — mid is the spec-guaranteed identifier and is robust across
+// browsers (including mobile Safari/Chrome quirks with multiple same-kind
+// m-lines, which raw array indexing isn't always reliable for).
+const MID_SCREEN_VIDEO = '0', MID_CAM_VIDEO = '1', MID_MIC_AUDIO = '2', MID_SCREEN_AUDIO = '3';
+function getT(mid) { return pc.getTransceivers().find(t => t.mid === mid); }
 
-let localScreenTrack = null;
+let localScreenStream = null; // full getDisplayMedia stream (video + tab audio)
 let localCamStream = null;
 let localMicStream = null;
 let micOn = false, camOn = false, sharing = false;
+
+// remote screen video+audio arrive on two separate transceivers; we merge
+// them into one MediaStream so the <video> tag plays them in sync
+const remoteScreenStream = new MediaStream();
+let remoteScreenVideoLive = false;
 
 const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
@@ -566,26 +577,54 @@ function showTileVideo(videoEl, on) {
 
 function safePlay(videoEl) { videoEl.play?.().catch(() => {}); }
 
+// decides what the main screen tile currently shows: your own share takes
+// priority on your own page (muted, since the real tab is already making
+// sound); otherwise the incoming remote share (audible)
+function refreshScreenDisplay() {
+  if (sharing && localScreenStream) {
+    screenVideo.srcObject = localScreenStream;
+    screenVideo.muted = true; // avoid hearing your own shared tab twice (echo)
+    screenVideo.style.display = 'block';
+    screenPlaceholder.style.display = 'none';
+    safePlay(screenVideo);
+  } else if (remoteScreenVideoLive) {
+    screenVideo.srcObject = remoteScreenStream;
+    screenVideo.muted = false; // you should hear the movie the other person shares
+    screenVideo.style.display = 'block';
+    screenPlaceholder.style.display = 'none';
+    safePlay(screenVideo);
+  } else {
+    screenVideo.srcObject = null;
+    screenVideo.style.display = 'none';
+    screenPlaceholder.style.display = 'flex';
+  }
+}
+
 // ---------------- WebRTC plumbing ----------------
 
 function bindOntrack() {
   pc.ontrack = (event) => {
-    const idx = pc.getTransceivers().indexOf(event.transceiver);
+    const mid = event.transceiver.mid;
     const track = event.track;
 
-    if (idx === T_SCREEN) {
-      screenVideo.srcObject = event.streams[0] || new MediaStream([track]);
+    if (mid === MID_SCREEN_VIDEO) {
       const sync = () => {
-        const live = !track.muted && track.readyState === 'live';
-        screenVideo.style.display = live ? 'block' : 'none';
-        screenPlaceholder.style.display = live ? 'none' : 'flex';
-        if (live) safePlay(screenVideo);
+        remoteScreenVideoLive = !track.muted && track.readyState === 'live';
+        refreshScreenDisplay();
       };
+      // (re)build the merged remote stream with the current video track
+      remoteScreenStream.getVideoTracks().forEach(t => remoteScreenStream.removeTrack(t));
+      remoteScreenStream.addTrack(track);
       track.onunmute = sync; track.onmute = sync; track.onended = sync;
       sync();
     }
 
-    if (idx === T_CAM) {
+    if (mid === MID_SCREEN_AUDIO) {
+      remoteScreenStream.getAudioTracks().forEach(t => remoteScreenStream.removeTrack(t));
+      remoteScreenStream.addTrack(track);
+    }
+
+    if (mid === MID_CAM_VIDEO) {
       const otherVideo = isHost ? camGuestVideo : camHostVideo;
       otherVideo.srcObject = event.streams[0] || new MediaStream([track]);
       const sync = () => {
@@ -597,7 +636,7 @@ function bindOntrack() {
       sync();
     }
 
-    if (idx === T_MIC) {
+    if (mid === MID_MIC_AUDIO) {
       const audioEl = new Audio();
       audioEl.srcObject = event.streams[0] || new MediaStream([track]);
       audioEl.autoplay = true;
@@ -615,9 +654,12 @@ function bindOntrack() {
 
 function attachPendingLocalTracks() {
   // apply any mic/cam/share already toggled on before the peer connected
-  if (micOn && localMicStream) pc.getTransceivers()[T_MIC].sender.replaceTrack(localMicStream.getAudioTracks()[0]);
-  if (camOn && localCamStream) pc.getTransceivers()[T_CAM].sender.replaceTrack(localCamStream.getVideoTracks()[0]);
-  if (sharing && localScreenTrack) pc.getTransceivers()[T_SCREEN].sender.replaceTrack(localScreenTrack);
+  if (micOn && localMicStream) getT(MID_MIC_AUDIO).sender.replaceTrack(localMicStream.getAudioTracks()[0]);
+  if (camOn && localCamStream) getT(MID_CAM_VIDEO).sender.replaceTrack(localCamStream.getVideoTracks()[0]);
+  if (sharing && localScreenStream) {
+    getT(MID_SCREEN_VIDEO).sender.replaceTrack(localScreenStream.getVideoTracks()[0] || null);
+    getT(MID_SCREEN_AUDIO).sender.replaceTrack(localScreenStream.getAudioTracks()[0] || null);
+  }
 }
 
 function closeExistingConnection() {
@@ -625,13 +667,14 @@ function closeExistingConnection() {
 }
 
 // OFFERER path (host, once a guest joins): this side must declare the
-// 3 transceivers itself, in the fixed order, before creating the offer.
+// 4 transceivers itself, in the fixed order, before creating the offer.
 async function startAsOfferer() {
   closeExistingConnection(); // never stack a second connection on repeated peer-joined events
   pc = new RTCPeerConnection(rtcConfig);
-  pc.addTransceiver('video', { direction: 'sendrecv' }); // screen
-  pc.addTransceiver('video', { direction: 'sendrecv' }); // cam
-  pc.addTransceiver('audio', { direction: 'sendrecv' }); // mic
+  pc.addTransceiver('video', { direction: 'sendrecv' }); // screen video
+  pc.addTransceiver('video', { direction: 'sendrecv' }); // cam video
+  pc.addTransceiver('audio', { direction: 'sendrecv' }); // mic audio
+  pc.addTransceiver('audio', { direction: 'sendrecv' }); // screen (tab) audio
   pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: 'ice', candidate: e.candidate })); };
   bindOntrack();
   attachPendingLocalTracks();
@@ -642,9 +685,8 @@ async function startAsOfferer() {
 
 // ANSWERER path (guest, receiving the offer): must NOT pre-create its own
 // transceivers — setRemoteDescription auto-creates them to match the
-// offer's m-line order (screen, cam, mic), guaranteeing both sides agree
-// on index 0/1/2. Creating our own transceivers here was the bug that made
-// camera/mic/screen show up scrambled or not at all on the other side.
+// offer's m-line order, and each gets a `mid` copied straight from the
+// offer, so both sides always agree on which transceiver is which.
 async function startAsAnswerer(offerSdp) {
   closeExistingConnection();
   pc = new RTCPeerConnection(rtcConfig);
@@ -692,8 +734,8 @@ ws.onmessage = async (event) => {
   if (msg.type === 'peer-left') {
     labelGuest.textContent = isHost ? 'En attente…' : 'Hôte';
     [statusHost, statusGuest].forEach(s => s.textContent = '');
-    screenVideo.style.display = 'none';
-    screenPlaceholder.style.display = 'flex';
+    remoteScreenVideoLive = false;
+    refreshScreenDisplay();
     showTileVideo(camGuestVideo, false);
     showTileVideo(camHostVideo, false);
     closeExistingConnection();
@@ -761,7 +803,7 @@ micBtn.onclick = async () => {
   localMicStream.getAudioTracks()[0].enabled = micOn;
   micBtn.classList.toggle('on', micOn);
   micBtn.classList.toggle('off', !micOn);
-  if (pc) pc.getTransceivers()[T_MIC].sender.replaceTrack(micOn ? localMicStream.getAudioTracks()[0] : null);
+  if (pc) getT(MID_MIC_AUDIO)?.sender.replaceTrack(micOn ? localMicStream.getAudioTracks()[0] : null);
 };
 
 camBtn.onclick = async () => {
@@ -770,6 +812,7 @@ camBtn.onclick = async () => {
     try { localCamStream = await navigator.mediaDevices.getUserMedia({ video: true }); }
     catch (e) { setStatus('Caméra refusée ou indisponible.'); return; }
     selfVideo.srcObject = localCamStream;
+    selfVideo.muted = true; // self-preview never needs its own audio channel
   }
   camOn = !camOn;
   localCamStream.getVideoTracks()[0].enabled = camOn;
@@ -777,29 +820,28 @@ camBtn.onclick = async () => {
   camBtn.classList.toggle('off', !camOn);
   showTileVideo(selfVideo, camOn);
   if (camOn) safePlay(selfVideo);
-  if (pc) pc.getTransceivers()[T_CAM].sender.replaceTrack(camOn ? localCamStream.getVideoTracks()[0] : null);
+  if (pc) getT(MID_CAM_VIDEO)?.sender.replaceTrack(camOn ? localCamStream.getVideoTracks()[0] : null);
 };
 
 function stopScreenShare() {
-  if (localScreenTrack) { localScreenTrack.stop(); localScreenTrack = null; }
+  if (localScreenStream) { localScreenStream.getTracks().forEach(t => t.stop()); localScreenStream = null; }
   sharing = false;
   shareBtn.textContent = "Partager l'écran";
   shareBtn.classList.remove('active');
   shareBadge.classList.remove('visible');
-  // clear the local self-preview only if it's showing OUR OWN share
-  // (not an incoming remote one)
-  screenVideo.srcObject = null;
-  screenVideo.style.display = 'none';
-  screenPlaceholder.style.display = 'flex';
-  if (pc) pc.getTransceivers()[T_SCREEN].sender.replaceTrack(null);
+  refreshScreenDisplay();
+  if (pc) {
+    getT(MID_SCREEN_VIDEO)?.sender.replaceTrack(null);
+    getT(MID_SCREEN_AUDIO)?.sender.replaceTrack(null);
+  }
 }
 
 shareBtn.onclick = async () => {
   if (sharing) { stopScreenShare(); return; }
 
-  // always fully stop any previous screen track before requesting a new one,
+  // always fully stop any previous screen stream before requesting a new one,
   // so the browser never shows more than one "sharing this tab" indicator.
-  if (localScreenTrack) { localScreenTrack.stop(); localScreenTrack = null; }
+  if (localScreenStream) { localScreenStream.getTracks().forEach(t => t.stop()); localScreenStream = null; }
 
   if (!navigator.mediaDevices?.getDisplayMedia) {
     setStatus("Le partage d'écran n'est pas pris en charge sur ce navigateur (courant sur mobile).");
@@ -808,23 +850,23 @@ shareBtn.onclick = async () => {
 
   try {
     const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
-    localScreenTrack = stream.getVideoTracks()[0];
+    localScreenStream = stream;
     sharing = true;
     shareBtn.textContent = 'Arrêter le partage';
     shareBtn.classList.add('active');
     shareBadge.classList.add('visible');
 
-    // show it on your own site too, directly from the local stream —
-    // this is a straight self-preview, not round-tripped through the network
-    screenVideo.srcObject = stream;
-    screenVideo.style.display = 'block';
-    screenPlaceholder.style.display = 'none';
-    safePlay(screenVideo);
+    // local self-preview, muted (see refreshScreenDisplay) to avoid the
+    // echo of hearing your own shared tab twice
+    refreshScreenDisplay();
 
     // catches the browser's own native "Stop sharing" button too
-    localScreenTrack.onended = () => stopScreenShare();
+    stream.getVideoTracks()[0].onended = () => stopScreenShare();
 
-    if (pc) pc.getTransceivers()[T_SCREEN].sender.replaceTrack(localScreenTrack);
+    if (pc) {
+      getT(MID_SCREEN_VIDEO)?.sender.replaceTrack(stream.getVideoTracks()[0] || null);
+      getT(MID_SCREEN_AUDIO)?.sender.replaceTrack(stream.getAudioTracks()[0] || null);
+    }
   } catch (e) {
     setStatus('Partage annulé.');
   }
