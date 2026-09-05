@@ -52,17 +52,37 @@ function leaveControlSocket(ws) {
 
 function leaveCurrentRoom(ws) {
   if (ws.roomCode && rooms.has(ws.roomCode)) {
-    const room = rooms.get(ws.roomCode);
+    const code = ws.roomCode;
+    const room = rooms.get(code);
+    const wasHost = ws.isHost;
     room.delete(ws);
-    broadcastToRoom(ws.roomCode, ws, { type: 'peer-left' });
-    if (room.size === 0) rooms.delete(ws.roomCode);
+
+    if (wasHost) {
+      // L'hôte a fermé/quitté : la session s'arrête pour tout le monde.
+      // On ne laisse jamais l'invité seul, en attente d'un hôte qui n'existe
+      // plus. On ferme le salon et on prévient tous les sockets restants
+      // (normalement juste l'invité) avec un message dédié, distinct de
+      // 'peer-left', pour que le client sache qu'il doit sortir complètement
+      // au lieu de repasser en simple "attente".
+      for (const client of room) {
+        if (client.readyState === 1) client.send(JSON.stringify({ type: 'host-left' }));
+        client.roomCode = null;
+      }
+      rooms.delete(code);
+      controlSockets.delete(code); // ferme aussi le script compagnon (pilotage) lié à ce salon
+    } else {
+      broadcastToRoom(code, ws, { type: 'peer-left' });
+      if (room.size === 0) rooms.delete(code);
+    }
   }
   ws.roomCode = null;
+  ws.isHost = false;
 }
 
 wss.on('connection', (ws) => {
   ws.roomCode = null;
   ws.controlCode = null;
+  ws.isHost = false;
 
   ws.on('message', (raw) => {
     let msg;
@@ -74,6 +94,7 @@ wss.on('connection', (ws) => {
       const code = Math.random().toString(36).substring(2, 7).toUpperCase();
       rooms.set(code, new Set([ws]));
       ws.roomCode = code;
+      ws.isHost = true;
       ws.send(JSON.stringify({ type: 'created', code }));
       return;
     }
@@ -87,6 +108,7 @@ wss.on('connection', (ws) => {
       }
       room.add(ws);
       ws.roomCode = msg.code;
+      ws.isHost = false;
       ws.send(JSON.stringify({ type: 'joined', code: msg.code }));
       broadcastToRoom(msg.code, ws, { type: 'peer-joined' });
       return;

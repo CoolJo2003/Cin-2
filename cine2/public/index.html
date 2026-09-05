@@ -568,7 +568,7 @@
     </div>
 
     <div class="video-link-row hidden" id="videoLinkRow">
-      <input type="text" id="videoLinkInput" placeholder="Coller un lien vidéo direct (.mp4, .webm…)">
+      <input type="text" id="videoLinkInput" placeholder="Lien YouTube, ou fichier direct .mp4/.webm (pas Netflix/Prime/Disney+)">
       <button class="btn-small btn-gold" id="videoLinkLoadBtn">Charger pour les deux</button>
     </div>
 
@@ -591,7 +591,7 @@
       <svg viewBox="0 0 24 24" fill="currentColor"><path d="M17 10.5V7a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3.5l4 4v-11l-4 4z"/></svg>
     </button>
     <button class="share-pill" id="shareBtn">Partager l'écran</button>
-    <button class="share-pill" id="videoLinkToggleBtn" title="Charger une vidéo par lien, contrôlable par les deux">🔗 Lien vidéo</button>
+    <button class="share-pill" id="videoLinkToggleBtn" title="YouTube ou fichier vidéo direct, contrôlable par les deux — pas Netflix/Prime/Disney+">🔗 Lien vidéo</button>
     <button class="ctrl-btn off" id="remoteControlBtn" title="Piloter à distance le contenu partagé (configuration requise une fois, bouton ⚙️)">🖱️</button>
     <button class="ctrl-btn off" id="pilotSetupBtn" title="Configurer le pilotage à distance (une fois)">⚙️</button>
     <div class="room-code-pill">SALON <b id="roomCodeTag"></b></div>
@@ -674,6 +674,14 @@ let remoteScreenVideoLive = false;
 const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
 function setStatus(msg) { statusEl.textContent = msg; }
+
+// Affiche un message laissé par la page précédente (ex: session terminée
+// par l'hôte) puis reload() vers la vue lobby, avant de l'effacer.
+const savedNotice = sessionStorage.getItem('cine2_notice');
+if (savedNotice) {
+  sessionStorage.removeItem('cine2_notice');
+  setStatus(savedNotice);
+}
 
 function enterRoomView() {
   lobby.classList.add('hidden');
@@ -879,10 +887,22 @@ setInterval(() => {
   vcTime.textContent = `${fmtTime(cur)} / ${fmtTime(dur)}`;
 }, 500);
 
+// Services de streaming avec DRM : ils bloquent volontairement l'affichage
+// dans une autre page (aucun <video src="..."> ni <iframe> ne fonctionnera
+// jamais ici, quel que soit le lien collé — ce n'est pas un bug côté Ciné2,
+// c'est une protection anti-copie côté Netflix/Prime/etc., impossible à
+// contourner depuis le navigateur). On détecte ces liens pour prévenir tout
+// de suite plutôt que de laisser croire que ça a "juste pas marché".
+const STREAMING_HOSTS_RE = /netflix\.com|primevideo\.com|amazon\.[a-z.]+\/gp\/video|disneyplus\.com|hbomax\.com|max\.com|hulu\.com|tv\.apple\.com|peacocktv\.com|paramountplus\.com|canalplus\.com|mycanal\.fr|crunchyroll\.com/i;
+
 videoLinkToggleBtn.onclick = () => videoLinkRow.classList.toggle('hidden');
 videoLinkLoadBtn.onclick = () => {
   const url = videoLinkInput.value.trim();
   if (!url) return;
+  if (STREAMING_HOSTS_RE.test(url)) {
+    setStatus("Netflix, Prime, Disney+... refusent volontairement d'être affichés dans une autre page (protection anti-copie) : impossible à charger par lien, quoi qu'on fasse. Pour ce genre de site, utilise plutôt \"Partager l'écran\", puis le pilotage 🖱️/⚙️ pour le contrôler à distance.");
+    return;
+  }
   loadSharedVideo(url, true);
   videoLinkRow.classList.add('hidden');
 };
@@ -1096,6 +1116,19 @@ ws.onmessage = async (event) => {
     showTileVideo(camHostVideo, false);
     stopSharedVideo();
     closeExistingConnection();
+  }
+
+  // L'hôte a quitté / fermé la session : contrairement à 'peer-left' (qui ne
+  // veut dire "l'autre personne n'est plus là pour l'instant", cas normal
+  // quand c'est l'invité qui part et où l'hôte peut simplement attendre),
+  // ici c'est l'hôte qui décide de fermer. La session s'arrête pour de bon :
+  // on ne laisse pas l'invité continuer tout seul, on le sort complètement,
+  // comme s'il avait cliqué "Quitter" lui-même.
+  if (msg.type === 'host-left') {
+    stopSharedVideo();
+    closeExistingConnection();
+    sessionStorage.setItem('cine2_notice', "L'hôte a quitté — la session est terminée.");
+    location.reload();
   }
 
   if (msg.type === 'offer') {
