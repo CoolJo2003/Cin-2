@@ -26,6 +26,16 @@ function broadcastToRoom(code, sender, data) {
   }
 }
 
+function leaveCurrentRoom(ws) {
+  if (ws.roomCode && rooms.has(ws.roomCode)) {
+    const room = rooms.get(ws.roomCode);
+    room.delete(ws);
+    broadcastToRoom(ws.roomCode, ws, { type: 'peer-left' });
+    if (room.size === 0) rooms.delete(ws.roomCode);
+  }
+  ws.roomCode = null;
+}
+
 wss.on('connection', (ws) => {
   ws.roomCode = null;
 
@@ -34,6 +44,7 @@ wss.on('connection', (ws) => {
     try { msg = JSON.parse(raw); } catch { return; }
 
     if (msg.type === 'create') {
+      leaveCurrentRoom(ws); // defensive: never let one socket sit in two rooms
       // génère un code de salon court
       const code = Math.random().toString(36).substring(2, 7).toUpperCase();
       rooms.set(code, new Set([ws]));
@@ -43,6 +54,7 @@ wss.on('connection', (ws) => {
     }
 
     if (msg.type === 'join') {
+      leaveCurrentRoom(ws); // defensive: never let one socket sit in two rooms
       const room = rooms.get(msg.code);
       if (!room || room.size >= 2) {
         ws.send(JSON.stringify({ type: 'error', message: 'Salon introuvable ou plein.' }));
@@ -61,14 +73,7 @@ wss.on('connection', (ws) => {
     }
   });
 
-  ws.on('close', () => {
-    if (ws.roomCode && rooms.has(ws.roomCode)) {
-      const room = rooms.get(ws.roomCode);
-      room.delete(ws);
-      broadcastToRoom(ws.roomCode, ws, { type: 'peer-left' });
-      if (room.size === 0) rooms.delete(ws.roomCode);
-    }
-  });
+  ws.on('close', () => leaveCurrentRoom(ws));
 });
 
 const PORT = process.env.PORT || 3000;

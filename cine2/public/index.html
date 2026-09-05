@@ -526,6 +526,7 @@ const labelGuest = $('labelGuest'), statusHost = $('statusHost'), statusGuest = 
 const micBtn = $('micBtn'), camBtn = $('camBtn'), shareBtn = $('shareBtn'), leaveBtn = $('leaveBtn'), fullscreenBtn = $('fullscreenBtn');
 const shareBadge = $('shareBadge');
 const copyLinkBtn = $('copyLinkBtn'), enterRoomBtn = $('enterRoomBtn');
+const createBtn = $('createBtn'), joinBtn = $('joinBtn');
 let pendingLink = '';
 
 const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -534,7 +535,7 @@ const ws = new WebSocket(`${wsProtocol}://${location.host}`);
 let pc = null;
 let isHost = false;
 let roomCode = null;
-let peerConnected = false;
+let hasJoinedOrCreated = false; // guards against double create/join clicks
 
 // transceiver order agreed in advance: 0 = screen video, 1 = cam video, 2 = mic audio
 const T_SCREEN = 0, T_CAM = 1, T_MIC = 2;
@@ -555,21 +556,19 @@ function enterRoomView() {
   $('labelHost').textContent = isHost ? 'Toi (hôte)' : 'Hôte';
 }
 
+// shows the video and hides the fallback icon together, so the icon never
+// squeezes the video tile's width via the flex layout
+function showTileVideo(videoEl, on) {
+  videoEl.style.display = on ? 'block' : 'none';
+  const fallback = videoEl.parentElement.querySelector('.avatar-fallback');
+  if (fallback) fallback.style.display = on ? 'none' : 'block';
+}
+
+function safePlay(videoEl) { videoEl.play?.().catch(() => {}); }
+
 // ---------------- WebRTC plumbing ----------------
 
-function createPeerConnection() {
-  pc = new RTCPeerConnection(rtcConfig);
-
-  // pre-create the 3 transceivers so both sides agree on m-line order
-  // and we never need renegotiation later (avoids the "stacked share bar" bug).
-  pc.addTransceiver('video', { direction: 'sendrecv' }); // screen
-  pc.addTransceiver('video', { direction: 'sendrecv' }); // cam
-  pc.addTransceiver('audio', { direction: 'sendrecv' }); // mic
-
-  pc.onicecandidate = (e) => {
-    if (e.candidate) ws.send(JSON.stringify({ type: 'ice', candidate: e.candidate }));
-  };
-
+function bindOntrack() {
   pc.ontrack = (event) => {
     const idx = pc.getTransceivers().indexOf(event.transceiver);
     const track = event.track;
@@ -580,6 +579,7 @@ function createPeerConnection() {
         const live = !track.muted && track.readyState === 'live';
         screenVideo.style.display = live ? 'block' : 'none';
         screenPlaceholder.style.display = live ? 'none' : 'flex';
+        if (live) safePlay(screenVideo);
       };
       track.onunmute = sync; track.onmute = sync; track.onended = sync;
       sync();
@@ -587,11 +587,11 @@ function createPeerConnection() {
 
     if (idx === T_CAM) {
       const otherVideo = isHost ? camGuestVideo : camHostVideo;
-      const otherAvatar = isHost ? avatarGuest : avatarHost;
       otherVideo.srcObject = event.streams[0] || new MediaStream([track]);
       const sync = () => {
         const live = !track.muted && track.readyState === 'live';
-        otherVideo.style.display = live ? 'block' : 'none';
+        showTileVideo(otherVideo, live);
+        if (live) safePlay(otherVideo);
       };
       track.onunmute = sync; track.onmute = sync; track.onended = sync;
       sync();
@@ -602,28 +602,59 @@ function createPeerConnection() {
       audioEl.srcObject = event.streams[0] || new MediaStream([track]);
       audioEl.autoplay = true;
       const otherStatus = isHost ? statusGuest : statusHost;
-      const sync = () => { otherStatus.textContent = (!track.muted && track.readyState === 'live') ? '🎤 micro ouvert' : ''; };
+      const sync = () => {
+        const live = !track.muted && track.readyState === 'live';
+        otherStatus.textContent = live ? '🎤 micro ouvert' : '';
+        if (live) safePlay(audioEl);
+      };
       track.onunmute = sync; track.onmute = sync; track.onended = sync;
       sync();
     }
   };
-
-  return pc;
 }
 
 function attachPendingLocalTracks() {
-  // apply any mic/cam already toggled on before the peer connected
+  // apply any mic/cam/share already toggled on before the peer connected
   if (micOn && localMicStream) pc.getTransceivers()[T_MIC].sender.replaceTrack(localMicStream.getAudioTracks()[0]);
   if (camOn && localCamStream) pc.getTransceivers()[T_CAM].sender.replaceTrack(localCamStream.getVideoTracks()[0]);
   if (sharing && localScreenTrack) pc.getTransceivers()[T_SCREEN].sender.replaceTrack(localScreenTrack);
 }
 
+function closeExistingConnection() {
+  if (pc) { try { pc.close(); } catch (e) {} pc = null; }
+}
+
+// OFFERER path (host, once a guest joins): this side must declare the
+// 3 transceivers itself, in the fixed order, before creating the offer.
 async function startAsOfferer() {
-  createPeerConnection();
+  closeExistingConnection(); // never stack a second connection on repeated peer-joined events
+  pc = new RTCPeerConnection(rtcConfig);
+  pc.addTransceiver('video', { direction: 'sendrecv' }); // screen
+  pc.addTransceiver('video', { direction: 'sendrecv' }); // cam
+  pc.addTransceiver('audio', { direction: 'sendrecv' }); // mic
+  pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: 'ice', candidate: e.candidate })); };
+  bindOntrack();
   attachPendingLocalTracks();
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
   ws.send(JSON.stringify({ type: 'offer', sdp: offer }));
+}
+
+// ANSWERER path (guest, receiving the offer): must NOT pre-create its own
+// transceivers — setRemoteDescription auto-creates them to match the
+// offer's m-line order (screen, cam, mic), guaranteeing both sides agree
+// on index 0/1/2. Creating our own transceivers here was the bug that made
+// camera/mic/screen show up scrambled or not at all on the other side.
+async function startAsAnswerer(offerSdp) {
+  closeExistingConnection();
+  pc = new RTCPeerConnection(rtcConfig);
+  pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: 'ice', candidate: e.candidate })); };
+  bindOntrack();
+  await pc.setRemoteDescription(new RTCSessionDescription(offerSdp));
+  attachPendingLocalTracks();
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  ws.send(JSON.stringify({ type: 'answer', sdp: answer }));
 }
 
 // ---------------- Signaling ----------------
@@ -637,7 +668,7 @@ ws.onmessage = async (event) => {
     pendingLink = `${location.origin}?join=${roomCode}`;
     shareLinkEl.textContent = pendingLink;
     roomInfo.style.display = 'block';
-    setStatus('Salon prêt. Copie le lien, envoie-le, puis entre quand tu veux.');
+    setStatus('Salon prêt. Copie le lien ou le code, envoie-le, puis entre quand tu veux.');
   }
 
   if (msg.type === 'joined') {
@@ -647,32 +678,29 @@ ws.onmessage = async (event) => {
     labelGuest.textContent = 'Toi (invité)';
   }
 
-  if (msg.type === 'error') setStatus('Erreur : ' + msg.message);
+  if (msg.type === 'error') {
+    setStatus('Erreur : ' + msg.message);
+    hasJoinedOrCreated = false;
+    createBtn.disabled = false;
+    joinBtn.disabled = false;
+  }
 
   if (msg.type === 'peer-joined') {
-    peerConnected = true;
     if (isHost) { labelGuest.textContent = 'Invité connecté'; await startAsOfferer(); }
   }
 
   if (msg.type === 'peer-left') {
-    peerConnected = false;
     labelGuest.textContent = isHost ? 'En attente…' : 'Hôte';
     [statusHost, statusGuest].forEach(s => s.textContent = '');
     screenVideo.style.display = 'none';
     screenPlaceholder.style.display = 'flex';
-    camGuestVideo.style.display = 'none';
-    camHostVideo.style.display = 'none';
-    if (pc) { pc.close(); pc = null; }
+    showTileVideo(camGuestVideo, false);
+    showTileVideo(camHostVideo, false);
+    closeExistingConnection();
   }
 
   if (msg.type === 'offer') {
-    createPeerConnection();
-    await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-    attachPendingLocalTracks();
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    ws.send(JSON.stringify({ type: 'answer', sdp: answer }));
-    peerConnected = true;
+    await startAsAnswerer(msg.sdp);
     labelGuest.textContent = isHost ? 'Invité connecté' : labelGuest.textContent;
   }
 
@@ -687,11 +715,22 @@ ws.onmessage = async (event) => {
 
 // ---------------- Lobby UI ----------------
 
-$('createBtn').onclick = () => { isHost = true; ws.send(JSON.stringify({ type: 'create' })); };
+createBtn.onclick = () => {
+  if (hasJoinedOrCreated) return; // block double clicks that create ghost sessions
+  hasJoinedOrCreated = true;
+  createBtn.disabled = true;
+  isHost = true;
+  ws.send(JSON.stringify({ type: 'create' }));
+};
+
 $('joinToggleBtn').onclick = () => $('joinRow').classList.toggle('hidden');
-$('joinBtn').onclick = () => {
+
+joinBtn.onclick = () => {
+  if (hasJoinedOrCreated) return; // block double clicks that create ghost sessions
   const code = $('codeInput').value.trim().toUpperCase();
   if (!code) return;
+  hasJoinedOrCreated = true;
+  joinBtn.disabled = true;
   isHost = false;
   ws.send(JSON.stringify({ type: 'join', code }));
 };
@@ -707,11 +746,9 @@ copyLinkBtn.onclick = async () => {
 };
 enterRoomBtn.onclick = () => enterRoomView();
 
-const params = new URLSearchParams(location.search);
-if (params.get('join')) {
-  $('joinRow').classList.remove('hidden');
-  $('codeInput').value = params.get('join');
-}
+// Note: the invited person must open the "Rejoindre" panel and type the
+// code themselves — the link no longer auto-fills or auto-opens it, so a
+// stray click can't accidentally send a duplicate join.
 
 // ---------------- Room controls ----------------
 
@@ -724,29 +761,23 @@ micBtn.onclick = async () => {
   localMicStream.getAudioTracks()[0].enabled = micOn;
   micBtn.classList.toggle('on', micOn);
   micBtn.classList.toggle('off', !micOn);
-  if (pc) {
-    const sender = pc.getTransceivers()[T_MIC].sender;
-    sender.replaceTrack(micOn ? localMicStream.getAudioTracks()[0] : null);
-  }
+  if (pc) pc.getTransceivers()[T_MIC].sender.replaceTrack(micOn ? localMicStream.getAudioTracks()[0] : null);
 };
 
 camBtn.onclick = async () => {
+  const selfVideo = isHost ? camHostVideo : camGuestVideo;
   if (!localCamStream) {
     try { localCamStream = await navigator.mediaDevices.getUserMedia({ video: true }); }
     catch (e) { setStatus('Caméra refusée ou indisponible.'); return; }
-    const selfVideo = isHost ? camHostVideo : camGuestVideo;
     selfVideo.srcObject = localCamStream;
   }
   camOn = !camOn;
   localCamStream.getVideoTracks()[0].enabled = camOn;
   camBtn.classList.toggle('on', camOn);
   camBtn.classList.toggle('off', !camOn);
-  const selfVideo = isHost ? camHostVideo : camGuestVideo;
-  selfVideo.style.display = camOn ? 'block' : 'none';
-  if (pc) {
-    const sender = pc.getTransceivers()[T_CAM].sender;
-    sender.replaceTrack(camOn ? localCamStream.getVideoTracks()[0] : null);
-  }
+  showTileVideo(selfVideo, camOn);
+  if (camOn) safePlay(selfVideo);
+  if (pc) pc.getTransceivers()[T_CAM].sender.replaceTrack(camOn ? localCamStream.getVideoTracks()[0] : null);
 };
 
 function stopScreenShare() {
@@ -755,6 +786,11 @@ function stopScreenShare() {
   shareBtn.textContent = "Partager l'écran";
   shareBtn.classList.remove('active');
   shareBadge.classList.remove('visible');
+  // clear the local self-preview only if it's showing OUR OWN share
+  // (not an incoming remote one)
+  screenVideo.srcObject = null;
+  screenVideo.style.display = 'none';
+  screenPlaceholder.style.display = 'flex';
   if (pc) pc.getTransceivers()[T_SCREEN].sender.replaceTrack(null);
 }
 
@@ -765,6 +801,11 @@ shareBtn.onclick = async () => {
   // so the browser never shows more than one "sharing this tab" indicator.
   if (localScreenTrack) { localScreenTrack.stop(); localScreenTrack = null; }
 
+  if (!navigator.mediaDevices?.getDisplayMedia) {
+    setStatus("Le partage d'écran n'est pas pris en charge sur ce navigateur (courant sur mobile).");
+    return;
+  }
+
   try {
     const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
     localScreenTrack = stream.getVideoTracks()[0];
@@ -772,6 +813,13 @@ shareBtn.onclick = async () => {
     shareBtn.textContent = 'Arrêter le partage';
     shareBtn.classList.add('active');
     shareBadge.classList.add('visible');
+
+    // show it on your own site too, directly from the local stream —
+    // this is a straight self-preview, not round-tripped through the network
+    screenVideo.srcObject = stream;
+    screenVideo.style.display = 'block';
+    screenPlaceholder.style.display = 'none';
+    safePlay(screenVideo);
 
     // catches the browser's own native "Stop sharing" button too
     localScreenTrack.onended = () => stopScreenShare();
@@ -794,7 +842,7 @@ document.addEventListener('fullscreenchange', () => {
   if (!document.fullscreenElement) room.classList.remove('fullscreen-mode');
 });
 
-leaveBtn.onclick = () => location.reload();
+leaveBtn.onclick = () => { closeExistingConnection(); location.reload(); };
 </script>
 
 </body>
