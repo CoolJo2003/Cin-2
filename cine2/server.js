@@ -16,6 +16,13 @@ const wss = new WebSocketServer({ server });
 // rooms: code -> Set de sockets (max 2 : host + viewer)
 const rooms = new Map();
 
+// controlSockets: code -> Set de sockets "pilote" (une instance du script
+// compagnon Tampermonkey, connectée depuis l'onglet Netflix/Prime/etc. de
+// la personne qui partage). Complètement séparé de `rooms` : ces sockets ne
+// comptent jamais dans la limite de 2 participants et ne reçoivent jamais
+// les messages offer/answer/ice/sync.
+const controlSockets = new Map();
+
 function broadcastToRoom(code, sender, data) {
   const room = rooms.get(code);
   if (!room) return;
@@ -24,6 +31,23 @@ function broadcastToRoom(code, sender, data) {
       client.send(JSON.stringify(data));
     }
   }
+}
+
+function broadcastToControllers(code, data) {
+  const set = controlSockets.get(code);
+  if (!set) return;
+  for (const client of set) {
+    if (client.readyState === 1) client.send(JSON.stringify(data));
+  }
+}
+
+function leaveControlSocket(ws) {
+  if (ws.controlCode && controlSockets.has(ws.controlCode)) {
+    const set = controlSockets.get(ws.controlCode);
+    set.delete(ws);
+    if (set.size === 0) controlSockets.delete(ws.controlCode);
+  }
+  ws.controlCode = null;
 }
 
 function leaveCurrentRoom(ws) {
@@ -38,6 +62,7 @@ function leaveCurrentRoom(ws) {
 
 wss.on('connection', (ws) => {
   ws.roomCode = null;
+  ws.controlCode = null;
 
   ws.on('message', (raw) => {
     let msg;
@@ -67,13 +92,37 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    // le script compagnon (Tampermonkey, dans l'onglet Netflix/Prime/etc.)
+    // rejoint un salon existant pour recevoir les commandes de pilotage —
+    // ne touche jamais à `rooms`, donc n'occupe pas une des 2 places.
+    if (msg.type === 'control-join') {
+      leaveControlSocket(ws);
+      if (!rooms.has(msg.code)) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Salon introuvable.' }));
+        return;
+      }
+      if (!controlSockets.has(msg.code)) controlSockets.set(msg.code, new Set());
+      controlSockets.get(msg.code).add(ws);
+      ws.controlCode = msg.code;
+      ws.send(JSON.stringify({ type: 'control-joined', code: msg.code }));
+      return;
+    }
+
+    // une app cliente (host ou invité) envoie une commande de pilotage
+    // (clic / touche) -> relayée uniquement aux scripts compagnons du salon
+    if (msg.type === 'remote-input' && ws.roomCode) {
+      broadcastToControllers(ws.roomCode, msg);
+      return;
+    }
+
     // relais direct des messages WebRTC (offer / answer / ice candidates)
-    if (['offer', 'answer', 'ice'].includes(msg.type) && ws.roomCode) {
+    // + des messages "sync" (lecture/pause/avance de la vidéo partagée par lien)
+    if (['offer', 'answer', 'ice', 'sync'].includes(msg.type) && ws.roomCode) {
       broadcastToRoom(ws.roomCode, ws, msg);
     }
   });
 
-  ws.on('close', () => leaveCurrentRoom(ws));
+  ws.on('close', () => { leaveCurrentRoom(ws); leaveControlSocket(ws); });
 });
 
 const PORT = process.env.PORT || 3000;

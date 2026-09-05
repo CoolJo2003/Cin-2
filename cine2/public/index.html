@@ -214,6 +214,73 @@
   }
   .screen-wrap:hover .fullscreen-btn { opacity: 1; }
 
+  /* embedded YouTube player, fills the same tile as screenVideo */
+  #youtubePlayer {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: none;
+  }
+  #youtubePlayer iframe { width: 100%; height: 100%; border: 0; }
+
+  /* overlay controls for "shared video link" mode: hidden until that mode
+     is active, then fades in on hover — this is the bit that lets the host
+     (or the guest) click play/pause/scrub directly on their own screen
+     instead of switching back to the original tab */
+  .video-controls {
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    display: none;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    background: linear-gradient(0deg, rgba(0,0,0,0.75), transparent);
+    opacity: 0;
+    transition: opacity 0.15s ease;
+    z-index: 3;
+  }
+  .video-controls.active { display: flex; }
+  .screen-wrap:hover .video-controls.active { opacity: 1; }
+  .vc-btn {
+    width: 32px; height: 32px;
+    border-radius: 50%;
+    background: rgba(255,255,255,0.15);
+    color: var(--text);
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .vc-seek { flex: 1; accent-color: var(--gold); }
+  .vc-time { font-size: 0.72rem; color: var(--muted); white-space: nowrap; }
+
+  .video-link-row {
+    display: flex;
+    gap: 8px;
+    padding: 0 20px 10px;
+    grid-column: 2;
+    position: relative;
+    z-index: 1;
+  }
+  .video-link-row input {
+    flex: 1;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--line);
+    background: var(--panel-2);
+    color: var(--text);
+    font-size: 0.85rem;
+    text-transform: none;
+  }
+
+  .pilot-setup-row {
+    padding: 0 20px 16px;
+    font-size: 0.82rem;
+    color: var(--muted);
+    line-height: 1.5;
+  }
+  .pilot-setup-row p { margin: 6px 0; }
+  .pilot-setup-row b { color: var(--text); }
+
   /* seats */
   .seat {
     display: flex;
@@ -484,6 +551,25 @@
         Écran libre — personne ne partage pour l'instant
       </div>
       <button class="fullscreen-btn" id="fullscreenBtn" title="Plein écran">⤢</button>
+
+      <div id="youtubePlayer"></div>
+
+      <!-- Shown only in "shared video link" mode: a real <video> element that
+           both sides control together, so hovering the screen and clicking
+           play/pause/the seek bar acts immediately, on your own page, with
+           no need to go find the content elsewhere. Not shown during a raw
+           getDisplayMedia screen-share, since that's just a pixel stream we
+           have no way to reach into. -->
+      <div class="video-controls" id="videoControls">
+        <button class="vc-btn" id="vcPlayPause" title="Lecture / Pause">▶</button>
+        <input type="range" id="vcSeek" class="vc-seek" min="0" max="100" value="0" step="0.1">
+        <span class="vc-time" id="vcTime">0:00 / 0:00</span>
+      </div>
+    </div>
+
+    <div class="video-link-row hidden" id="videoLinkRow">
+      <input type="text" id="videoLinkInput" placeholder="Coller un lien vidéo direct (.mp4, .webm…)">
+      <button class="btn-small btn-gold" id="videoLinkLoadBtn">Charger pour les deux</button>
     </div>
 
     <div class="seat seat-right" id="seatGuest">
@@ -505,8 +591,17 @@
       <svg viewBox="0 0 24 24" fill="currentColor"><path d="M17 10.5V7a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3.5l4 4v-11l-4 4z"/></svg>
     </button>
     <button class="share-pill" id="shareBtn">Partager l'écran</button>
+    <button class="share-pill" id="videoLinkToggleBtn" title="Charger une vidéo par lien, contrôlable par les deux">🔗 Lien vidéo</button>
+    <button class="ctrl-btn off" id="remoteControlBtn" title="Piloter à distance le contenu partagé (configuration requise une fois, bouton ⚙️)">🖱️</button>
+    <button class="ctrl-btn off" id="pilotSetupBtn" title="Configurer le pilotage à distance (une fois)">⚙️</button>
     <div class="room-code-pill">SALON <b id="roomCodeTag"></b></div>
     <button class="ctrl-btn danger" id="leaveBtn" title="Quitter">✕</button>
+  </div>
+
+  <div class="pilot-setup-row hidden" id="pilotSetupRow">
+    <p><b>1.</b> Fais glisser ce bouton dans ta barre de favoris — une seule fois, pour toujours :</p>
+    <a href="#" id="pilotBookmarklet" class="btn btn-gold btn-small" style="display:inline-block;">🎬 Piloter Ciné2</a>
+    <p><b>2.</b> Une fois l'écran de l'autre partagé (Netflix, Prime…), clique ce favori sur son onglet, entre le code de salon <b id="pilotRoomCodeHint">—</b>, puis "Connecter". Ensuite, clique 🖱️ ici et pilote directement depuis l'écran de ton app.</p>
   </div>
 </div>
 
@@ -525,6 +620,18 @@ const labelGuest = $('labelGuest'), statusHost = $('statusHost'), statusGuest = 
 
 const micBtn = $('micBtn'), camBtn = $('camBtn'), shareBtn = $('shareBtn'), leaveBtn = $('leaveBtn'), fullscreenBtn = $('fullscreenBtn');
 const shareBadge = $('shareBadge');
+
+// ---- Shared video link (real remote control, unlike raw screen-share) ----
+const videoLinkToggleBtn = $('videoLinkToggleBtn'), videoLinkRow = $('videoLinkRow');
+const videoLinkInput = $('videoLinkInput'), videoLinkLoadBtn = $('videoLinkLoadBtn');
+const youtubePlayerDiv = $('youtubePlayer');
+const videoControls = $('videoControls'), vcPlayPause = $('vcPlayPause'), vcSeek = $('vcSeek'), vcTime = $('vcTime');
+
+let videoLinkMode = null; // null | 'file' | 'youtube'
+let ytPlayer = null;
+let ytApiReadyPromise = null;
+let applyingRemoteSync = false; // guards against echoing a remote command back out
+let vcSeekDragging = false;
 const copyLinkBtn = $('copyLinkBtn'), enterRoomBtn = $('enterRoomBtn');
 const createBtn = $('createBtn'), joinBtn = $('joinBtn');
 let pendingLink = '';
@@ -535,6 +642,14 @@ const ws = new WebSocket(`${wsProtocol}://${location.host}`);
 let pc = null;
 let isHost = false;
 let roomCode = null;
+// ICE candidates can arrive over the websocket before setRemoteDescription
+// has finished (the ws message queue doesn't wait for our async handlers).
+// Any candidate that shows up too early used to be silently dropped by the
+// try/catch below, which could quietly break the connection in one
+// direction (e.g. guest's mic/cam reaching the host) depending on timing.
+// We now queue them and flush once the remote description is actually set.
+let remoteDescSet = false;
+let pendingIceCandidates = [];
 let hasJoinedOrCreated = false; // guards against double create/join clicks
 
 // 4 transceivers negotiated in this fixed order: screen video, cam video,
@@ -564,6 +679,7 @@ function enterRoomView() {
   lobby.classList.add('hidden');
   room.classList.remove('hidden');
   roomCodeTag.textContent = roomCode;
+  pilotRoomCodeHint.textContent = roomCode;
   $('labelHost').textContent = isHost ? 'Toi (hôte)' : 'Hôte';
 }
 
@@ -581,6 +697,7 @@ function safePlay(videoEl) { videoEl.play?.().catch(() => {}); }
 // priority on your own page (muted, since the real tab is already making
 // sound); otherwise the incoming remote share (audible)
 function refreshScreenDisplay() {
+  if (videoLinkMode) return; // shared video link owns the screen tile right now
   if (sharing && localScreenStream) {
     screenVideo.srcObject = localScreenStream;
     screenVideo.muted = true; // avoid hearing your own shared tab twice (echo)
@@ -599,6 +716,234 @@ function refreshScreenDisplay() {
     screenPlaceholder.style.display = 'flex';
   }
 }
+
+// ---------------- Shared video link (real, working remote control) ----------------
+// Unlike getDisplayMedia (raw pixels, nothing to click into), this loads the
+// content as an actual element inside the page — a native <video> for direct
+// file links, or the official YouTube embed for YouTube links — so a click
+// on either side's screen tile genuinely drives playback for both people.
+
+function extractYouTubeId(url) {
+  const patterns = [
+    /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([\w-]{11})/
+  ];
+  for (const re of patterns) {
+    const m = url.match(re);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+function loadYouTubeApi() {
+  if (ytApiReadyPromise) return ytApiReadyPromise;
+  ytApiReadyPromise = new Promise((resolve) => {
+    if (window.YT && window.YT.Player) { resolve(); return; }
+    const tag = document.createElement('script');
+    tag.src = 'https://www.youtube.com/iframe_api';
+    document.head.appendChild(tag);
+    window.onYouTubeIframeAPIReady = () => resolve();
+  });
+  return ytApiReadyPromise;
+}
+
+function fmtTime(s) {
+  if (!isFinite(s) || s < 0) s = 0;
+  const m = Math.floor(s / 60), sec = Math.floor(s % 60);
+  return `${m}:${sec.toString().padStart(2, '0')}`;
+}
+
+function stopSharedVideo() {
+  videoLinkMode = null;
+  videoControls.classList.remove('active');
+  youtubePlayerDiv.style.display = 'none';
+  screenVideo.removeAttribute('src');
+  screenVideo.load();
+  refreshScreenDisplay();
+}
+
+// current-time / duration / play / pause / seek, abstracted over the two
+// underlying players so the overlay controls don't need to care which one
+function mediaGetTime() {
+  if (videoLinkMode === 'youtube') return ytPlayer?.getCurrentTime?.() || 0;
+  if (videoLinkMode === 'file') return screenVideo.currentTime || 0;
+  return 0;
+}
+function mediaGetDuration() {
+  if (videoLinkMode === 'youtube') return ytPlayer?.getDuration?.() || 0;
+  if (videoLinkMode === 'file') return screenVideo.duration || 0;
+  return 0;
+}
+function mediaPlay() {
+  if (videoLinkMode === 'youtube') ytPlayer?.playVideo?.();
+  if (videoLinkMode === 'file') safePlay(screenVideo);
+}
+function mediaPause() {
+  if (videoLinkMode === 'youtube') ytPlayer?.pauseVideo?.();
+  if (videoLinkMode === 'file') screenVideo.pause();
+}
+function mediaSeek(t) {
+  if (videoLinkMode === 'youtube') ytPlayer?.seekTo?.(t, true);
+  if (videoLinkMode === 'file') screenVideo.currentTime = t;
+}
+
+function sendSync(action, extra) {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: 'sync', action, time: mediaGetTime(), ...extra }));
+}
+
+async function loadSharedVideo(url, broadcast) {
+  if (sharing) stopScreenShare(); // the two modes are mutually exclusive
+
+  const ytId = extractYouTubeId(url);
+  screenPlaceholder.style.display = 'none';
+
+  if (ytId) {
+    videoLinkMode = 'youtube';
+    screenVideo.style.display = 'none';
+    youtubePlayerDiv.style.display = 'block';
+    await loadYouTubeApi();
+    if (!ytPlayer) {
+      await new Promise((resolve) => {
+        ytPlayer = new YT.Player('youtubePlayer', {
+          videoId: ytId,
+          playerVars: { playsinline: 1, rel: 0 },
+          events: {
+            onReady: () => resolve(),
+            onStateChange: onYtStateChange
+          }
+        });
+      });
+    } else {
+      ytPlayer.loadVideoById(ytId);
+    }
+  } else {
+    videoLinkMode = 'file';
+    youtubePlayerDiv.style.display = 'none';
+    screenVideo.style.display = 'block';
+    screenVideo.srcObject = null;
+    screenVideo.src = url;
+    screenVideo.muted = false;
+    safePlay(screenVideo);
+  }
+
+  videoControls.classList.add('active');
+  vcPlayPause.textContent = '▶';
+
+  if (broadcast) {
+    ws.send(JSON.stringify({ type: 'sync', action: 'load', url }));
+  }
+}
+
+function onYtStateChange(e) {
+  if (applyingRemoteSync) return;
+  if (e.data === YT.PlayerState.PLAYING) { vcPlayPause.textContent = '⏸'; sendSync('play'); }
+  if (e.data === YT.PlayerState.PAUSED) { vcPlayPause.textContent = '▶'; sendSync('pause'); }
+}
+
+// local-file <video> events -> broadcast to the peer (skipped while we're
+// the ones applying a command that just came from the peer)
+screenVideo.addEventListener('play', () => {
+  if (videoLinkMode !== 'file' || applyingRemoteSync) return;
+  vcPlayPause.textContent = '⏸';
+  sendSync('play');
+});
+screenVideo.addEventListener('pause', () => {
+  if (videoLinkMode !== 'file' || applyingRemoteSync) return;
+  vcPlayPause.textContent = '▶';
+  sendSync('pause');
+});
+screenVideo.addEventListener('seeked', () => {
+  if (videoLinkMode !== 'file' || applyingRemoteSync) return;
+  sendSync('seek');
+});
+
+// overlay controls, shared by both playback modes
+vcPlayPause.onclick = () => {
+  if (!videoLinkMode) return;
+  const playing = vcPlayPause.textContent === '⏸';
+  if (playing) mediaPause(); else mediaPlay();
+  vcPlayPause.textContent = playing ? '▶' : '⏸';
+};
+vcSeek.addEventListener('pointerdown', () => { vcSeekDragging = true; });
+vcSeek.addEventListener('change', () => {
+  if (!videoLinkMode) return;
+  mediaSeek(Number(vcSeek.value));
+  sendSync('seek');
+  vcSeekDragging = false;
+});
+setInterval(() => {
+  if (!videoLinkMode || vcSeekDragging) return;
+  const dur = mediaGetDuration(), cur = mediaGetTime();
+  vcSeek.max = dur || 0;
+  vcSeek.value = cur || 0;
+  vcTime.textContent = `${fmtTime(cur)} / ${fmtTime(dur)}`;
+}, 500);
+
+videoLinkToggleBtn.onclick = () => videoLinkRow.classList.toggle('hidden');
+videoLinkLoadBtn.onclick = () => {
+  const url = videoLinkInput.value.trim();
+  if (!url) return;
+  loadSharedVideo(url, true);
+  videoLinkRow.classList.add('hidden');
+};
+
+// ---------------- Remote piloting of an arbitrary shared tab ----------------
+// This only makes sense over a raw screen-share (Netflix, Prime, Disney+...),
+// since the "shared video link" mode above already gives real, direct
+// control on its own. Requires the companion userscript running on the
+// OTHER person's actual tab — see cine2-remote-control.user.js.
+const remoteControlBtn = $('remoteControlBtn');
+const pilotSetupBtn = $('pilotSetupBtn'), pilotSetupRow = $('pilotSetupRow');
+const pilotBookmarklet = $('pilotBookmarklet'), pilotRoomCodeHint = $('pilotRoomCodeHint');
+let pilotMode = false;
+
+// builds the "🎬 Piloter Ciné2" favori: dragging it to the bookmarks bar
+// once is the only setup step. Clicking it later, on the tab being shared,
+// injects our small control receiver (control.js) into that page — no
+// extension, no separate script manager needed. The server address is baked
+// in here automatically, so nothing to type except the room code, later.
+function buildPilotBookmarklet() {
+  const wsUrl = location.origin.replace(/^http/, 'ws');
+  const controlSrc = `${location.origin}/control.js?server=${encodeURIComponent(wsUrl)}`;
+  const code = `(function(){var s=document.createElement('script');s.src='${controlSrc}&t='+Date.now();document.body.appendChild(s);})()`;
+  pilotBookmarklet.href = 'javascript:' + encodeURIComponent(code);
+}
+buildPilotBookmarklet();
+
+pilotSetupBtn.onclick = () => pilotSetupRow.classList.toggle('hidden');
+
+remoteControlBtn.onclick = () => {
+  pilotMode = !pilotMode;
+  remoteControlBtn.classList.toggle('on', pilotMode);
+  remoteControlBtn.classList.toggle('off', !pilotMode);
+  screenWrap.style.cursor = pilotMode ? 'crosshair' : '';
+  setStatus(pilotMode
+    ? "🖱️ Pilotage actif : clique sur l'écran ou tape au clavier, ça agit chez l'autre (script compagnon requis là-bas, et l'autre doit partager \"cet onglet\" précisément)."
+    : '');
+};
+
+// translate a click on the video tile into a fraction (0–1, 0–1) of the
+// actual shared content — accounting for the letterboxing that
+// object-fit: contain introduces when the aspect ratios don't match
+screenWrap.addEventListener('click', (e) => {
+  if (!pilotMode || videoLinkMode) return;
+  const vw = screenVideo.videoWidth, vh = screenVideo.videoHeight;
+  if (!vw || !vh) return;
+  const rect = screenVideo.getBoundingClientRect();
+  const scale = Math.min(rect.width / vw, rect.height / vh);
+  const dispW = vw * scale, dispH = vh * scale;
+  const offsetX = (rect.width - dispW) / 2, offsetY = (rect.height - dispH) / 2;
+  const localX = e.clientX - rect.left - offsetX;
+  const localY = e.clientY - rect.top - offsetY;
+  if (localX < 0 || localY < 0 || localX > dispW || localY > dispH) return; // hit a letterbox bar, not the content
+  ws.send(JSON.stringify({ type: 'remote-input', kind: 'click', xf: localX / dispW, yf: localY / dispH }));
+});
+
+document.addEventListener('keydown', (e) => {
+  if (!pilotMode || videoLinkMode) return;
+  if (['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName)) return; // don't hijack our own fields
+  ws.send(JSON.stringify({ type: 'remote-input', kind: 'key', key: e.key, code: e.code }));
+});
 
 // ---------------- WebRTC plumbing ----------------
 
@@ -664,6 +1009,15 @@ function attachPendingLocalTracks() {
 
 function closeExistingConnection() {
   if (pc) { try { pc.close(); } catch (e) {} pc = null; }
+  remoteDescSet = false;
+  pendingIceCandidates = [];
+}
+
+async function flushPendingIce() {
+  while (pendingIceCandidates.length) {
+    const candidate = pendingIceCandidates.shift();
+    try { await pc.addIceCandidate(candidate); } catch (e) {}
+  }
 }
 
 // OFFERER path (host, once a guest joins): this side must declare the
@@ -693,6 +1047,8 @@ async function startAsAnswerer(offerSdp) {
   pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: 'ice', candidate: e.candidate })); };
   bindOntrack();
   await pc.setRemoteDescription(new RTCSessionDescription(offerSdp));
+  remoteDescSet = true;
+  await flushPendingIce();
   attachPendingLocalTracks();
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
@@ -738,6 +1094,7 @@ ws.onmessage = async (event) => {
     refreshScreenDisplay();
     showTileVideo(camGuestVideo, false);
     showTileVideo(camHostVideo, false);
+    stopSharedVideo();
     closeExistingConnection();
   }
 
@@ -748,10 +1105,30 @@ ws.onmessage = async (event) => {
 
   if (msg.type === 'answer') {
     await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+    remoteDescSet = true;
+    await flushPendingIce();
   }
 
-  if (msg.type === 'ice' && pc) {
-    try { await pc.addIceCandidate(msg.candidate); } catch (e) {}
+  if (msg.type === 'sync') {
+    applyingRemoteSync = true;
+    if (msg.action === 'load') {
+      await loadSharedVideo(msg.url, false);
+    } else if (msg.action === 'play') {
+      mediaSeek(msg.time); mediaPlay(); vcPlayPause.textContent = '⏸';
+    } else if (msg.action === 'pause') {
+      mediaSeek(msg.time); mediaPause(); vcPlayPause.textContent = '▶';
+    } else if (msg.action === 'seek') {
+      mediaSeek(msg.time);
+    }
+    setTimeout(() => { applyingRemoteSync = false; }, 300);
+  }
+
+  if (msg.type === 'ice') {
+    if (pc && remoteDescSet) {
+      try { await pc.addIceCandidate(msg.candidate); } catch (e) {}
+    } else if (pc) {
+      pendingIceCandidates.push(msg.candidate);
+    }
   }
 };
 
@@ -838,6 +1215,7 @@ function stopScreenShare() {
 
 shareBtn.onclick = async () => {
   if (sharing) { stopScreenShare(); return; }
+  if (videoLinkMode) stopSharedVideo();
 
   // always fully stop any previous screen stream before requesting a new one,
   // so the browser never shows more than one "sharing this tab" indicator.
@@ -884,7 +1262,7 @@ document.addEventListener('fullscreenchange', () => {
   if (!document.fullscreenElement) room.classList.remove('fullscreen-mode');
 });
 
-leaveBtn.onclick = () => { closeExistingConnection(); location.reload(); };
+leaveBtn.onclick = () => { stopSharedVideo(); closeExistingConnection(); location.reload(); };
 </script>
 
 </body>
