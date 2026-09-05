@@ -253,6 +253,22 @@
   .vc-seek { flex: 1; accent-color: var(--gold); }
   .vc-time { font-size: 0.72rem; color: var(--muted); white-space: nowrap; }
 
+  /* télécommande de pilotage (mode écran partagé brut) : mêmes boutons ronds
+     que la barre "lien vidéo", mais toujours visible (pas de fondu au survol)
+     tant que le pilotage est actif */
+  .remote-pad {
+    position: absolute;
+    left: 50%; bottom: 12px; transform: translateX(-50%);
+    display: flex; gap: 10px;
+    padding: 8px 14px;
+    background: rgba(20,16,28,0.75);
+    border-radius: 999px;
+    z-index: 3;
+  }
+  .remote-pad.hidden { display: none; }
+  .remote-pad .vc-btn { width: 38px; height: 38px; font-size: 16px; background: rgba(255,255,255,0.12); }
+  .remote-pad .vc-btn:active { background: rgba(255,214,107,0.35); }
+
   .video-link-row {
     display: flex;
     gap: 8px;
@@ -479,6 +495,19 @@
 
   /* simple universal mic / camera icons */
   .ctrl-btn svg { width: 20px; height: 20px; }
+
+  /* ---- crop overlay: pick just the video area of a screen-share, so the
+     peer doesn't see black letterbox bars / browser chrome around it ---- */
+  .crop-overlay { position: fixed; inset: 0; background: rgba(10,6,20,0.86); z-index: 3000; display: flex; align-items: center; justify-content: center; padding: 20px; }
+  .crop-overlay.hidden { display: none; }
+  .crop-panel { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 20px; max-width: min(92vw, 720px); width: 100%; display: flex; flex-direction: column; gap: 12px; box-shadow: 0 20px 60px rgba(0,0,0,0.5); }
+  .crop-title { font-weight: 600; color: var(--text); margin: 0; font-size: 15px; }
+  .crop-hint { font-size: 12px; color: var(--muted); margin: 0; }
+  .crop-preview-wrap { position: relative; width: 100%; aspect-ratio: 16/9; background: #000; border-radius: 10px; overflow: hidden; cursor: crosshair; user-select: none; }
+  .crop-preview-wrap video { width: 100%; height: 100%; object-fit: contain; pointer-events: none; }
+  .crop-rect { position: absolute; border: 2px solid var(--gold); background: rgba(255,214,107,0.12); box-sizing: border-box; pointer-events: none; display: none; }
+  .crop-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .crop-actions .btn-small { flex: 1 1 auto; }
 </style>
 </head>
 <body>
@@ -554,6 +583,17 @@
 
       <div id="youtubePlayer"></div>
 
+      <!-- "Télécommande" : visible en mode pilotage sur un écran partagé
+           brut (Netflix, Movix...). Rejoue de vraies touches clavier
+           universelles (espace, flèches) sur la page réelle de la personne
+           qui partage — donc un vrai pause/retour/avance, pas une
+           simulation locale. -->
+      <div class="remote-pad hidden" id="remotePad">
+        <button class="vc-btn" id="remoteRewindBtn" title="Reculer ~10s">⏪</button>
+        <button class="vc-btn" id="remotePlayPauseBtn" title="Lecture / Pause">⏯</button>
+        <button class="vc-btn" id="remoteForwardBtn" title="Avancer ~10s">⏩</button>
+      </div>
+
       <!-- Shown only in "shared video link" mode: a real <video> element that
            both sides control together, so hovering the screen and clicking
            play/pause/the seek bar acts immediately, on your own page, with
@@ -605,6 +645,25 @@
   </div>
 </div>
 
+<!-- ============ CROP OVERLAY: choisir juste la zone vidéo du partage ============ -->
+<div class="crop-overlay hidden" id="cropOverlay">
+  <div class="crop-panel">
+    <p class="crop-title">🎯 Cadrer le partage</p>
+    <div class="crop-preview-wrap" id="cropPreviewWrap">
+      <video id="cropPreviewVideo" autoplay playsinline muted></video>
+      <div class="crop-rect" id="cropRect"></div>
+    </div>
+    <p class="crop-hint">Fais glisser un rectangle sur la zone qui contient juste l'image du film (sans les bandes noires ni la barre du navigateur) — ou laisse "Détecter automatiquement" faire le travail.</p>
+    <div class="crop-actions">
+      <button class="btn-small btn-ghost" id="cropAutoBtn">✨ Détecter automatiquement</button>
+      <button class="btn-small btn-ghost" id="cropResetBtn">Tout l'écran</button>
+      <button class="btn-small btn-gold" id="cropConfirmBtn">Valider</button>
+    </div>
+  </div>
+</div>
+<video id="cropSourceVideo" style="display:none;" playsinline muted></video>
+<canvas id="cropCanvasOut" style="display:none;"></canvas>
+
 <script>
 const $ = (id) => document.getElementById(id);
 
@@ -620,6 +679,14 @@ const labelGuest = $('labelGuest'), statusHost = $('statusHost'), statusGuest = 
 
 const micBtn = $('micBtn'), camBtn = $('camBtn'), shareBtn = $('shareBtn'), leaveBtn = $('leaveBtn'), fullscreenBtn = $('fullscreenBtn');
 const shareBadge = $('shareBadge');
+
+// ---- Cadrage du partage d'écran : ne garder que la zone vidéo (pas les
+// bandes noires ni la barre du navigateur) ----
+const cropOverlay = $('cropOverlay'), cropPreviewWrap = $('cropPreviewWrap'), cropPreviewVideo = $('cropPreviewVideo');
+const cropRectEl = $('cropRect'), cropAutoBtn = $('cropAutoBtn'), cropResetBtn = $('cropResetBtn'), cropConfirmBtn = $('cropConfirmBtn');
+const cropSourceVideo = $('cropSourceVideo'), cropCanvasOut = $('cropCanvasOut');
+let rawScreenStream = null; // le flux getDisplayMedia() brut, gardé pour pouvoir couper le partage proprement
+let cropLoopActive = false, screenCropAnimId = null;
 
 // ---- Shared video link (real remote control, unlike raw screen-share) ----
 const videoLinkToggleBtn = $('videoLinkToggleBtn'), videoLinkRow = $('videoLinkRow');
@@ -767,6 +834,7 @@ function stopSharedVideo() {
   screenVideo.removeAttribute('src');
   screenVideo.load();
   refreshScreenDisplay();
+  remotePad.classList.toggle('hidden', !pilotMode);
 }
 
 // current-time / duration / play / pause / seek, abstracted over the two
@@ -804,6 +872,7 @@ async function loadSharedVideo(url, broadcast) {
 
   const ytId = extractYouTubeId(url);
   screenPlaceholder.style.display = 'none';
+  remotePad.classList.add('hidden'); // le pilotage clic/touche n'a de sens que sur un écran partagé brut
 
   if (ytId) {
     videoLinkMode = 'youtube';
@@ -915,6 +984,7 @@ videoLinkLoadBtn.onclick = () => {
 const remoteControlBtn = $('remoteControlBtn');
 const pilotSetupBtn = $('pilotSetupBtn'), pilotSetupRow = $('pilotSetupRow');
 const pilotBookmarklet = $('pilotBookmarklet'), pilotRoomCodeHint = $('pilotRoomCodeHint');
+const remotePad = $('remotePad'), remoteRewindBtn = $('remoteRewindBtn'), remotePlayPauseBtn = $('remotePlayPauseBtn'), remoteForwardBtn = $('remoteForwardBtn');
 let pilotMode = false;
 
 // builds the "🎬 Piloter Ciné2" favori: dragging it to the bookmarks bar
@@ -937,10 +1007,26 @@ remoteControlBtn.onclick = () => {
   remoteControlBtn.classList.toggle('on', pilotMode);
   remoteControlBtn.classList.toggle('off', !pilotMode);
   screenWrap.style.cursor = pilotMode ? 'crosshair' : '';
+  remotePad.classList.toggle('hidden', !pilotMode || !!videoLinkMode);
   setStatus(pilotMode
-    ? "🖱️ Pilotage actif : clique sur l'écran ou tape au clavier, ça agit chez l'autre (script compagnon requis là-bas, et l'autre doit partager \"cet onglet\" précisément)."
+    ? "🖱️ Pilotage actif : clique sur l'écran ou utilise la télécommande ⏪⏯⏩, ça agit chez l'autre (script compagnon requis là-bas, et l'autre doit partager \"cet onglet\" précisément)."
     : '');
 };
+
+// Télécommande façon "ciné" : plutôt que de viser un bouton pixel par pixel
+// sur l'écran partagé, on rejoue directement les raccourcis clavier
+// universels que la quasi-totalité des lecteurs vidéo (Netflix, Prime,
+// YouTube, Disney+...) écoutent nativement : Espace = lecture/pause,
+// flèches = reculer/avancer d'environ 10s. Passe par le même canal
+// 'remote-input' que les clics, donc ça atteint le script compagnon
+// (control.js) branché sur la vraie page de la personne qui partage.
+function sendRemoteKey(key, code) {
+  if (!pilotMode) return;
+  ws.send(JSON.stringify({ type: 'remote-input', kind: 'key', key, code }));
+}
+remotePlayPauseBtn.onclick = () => sendRemoteKey(' ', 'Space');
+remoteRewindBtn.onclick = () => sendRemoteKey('ArrowLeft', 'ArrowLeft');
+remoteForwardBtn.onclick = () => sendRemoteKey('ArrowRight', 'ArrowRight');
 
 // translate a click on the video tile into a fraction (0–1, 0–1) of the
 // actual shared content — accounting for the letterboxing that
@@ -1234,7 +1320,11 @@ camBtn.onclick = async () => {
 };
 
 function stopScreenShare() {
+  cropLoopActive = false;
+  if (screenCropAnimId) { cancelAnimationFrame(screenCropAnimId); screenCropAnimId = null; }
+  if (rawScreenStream) { rawScreenStream.getTracks().forEach(t => t.stop()); rawScreenStream = null; }
   if (localScreenStream) { localScreenStream.getTracks().forEach(t => t.stop()); localScreenStream = null; }
+  cropSourceVideo.srcObject = null;
   sharing = false;
   shareBtn.textContent = "Partager l'écran";
   shareBtn.classList.remove('active');
@@ -1246,12 +1336,166 @@ function stopScreenShare() {
   }
 }
 
+// Échantillonne la frame courante à basse résolution et cherche la boîte qui
+// contient l'image réelle (tout ce qui dépasse un seuil de luminosité),
+// pour retirer automatiquement les bandes noires du haut/bas ou des côtés.
+// Renvoie {x,y,w,h} normalisé (0..1) dans l'espace de la vidéo source, ou
+// null si rien d'utile à rogner (image déjà pleine, ou détection ratée).
+function detectContentBounds(video) {
+  const w = video.videoWidth, h = video.videoHeight;
+  if (!w || !h) return null;
+  const sw = 160, sh = Math.max(1, Math.round(sw * (h / w)));
+  const tmp = document.createElement('canvas');
+  tmp.width = sw; tmp.height = sh;
+  const ctx = tmp.getContext('2d');
+  ctx.drawImage(video, 0, 0, sw, sh);
+  let data;
+  try { data = ctx.getImageData(0, 0, sw, sh).data; } catch (e) { return null; }
+  const THRESH = 18; // luminosité en dessous de ça = considéré comme "bande noire"
+  const rowHasContent = new Array(sh).fill(false);
+  const colHasContent = new Array(sw).fill(false);
+  for (let y = 0; y < sh; y++) {
+    for (let x = 0; x < sw; x++) {
+      const i = (y * sw + x) * 4;
+      const luma = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      if (luma > THRESH) { rowHasContent[y] = true; colHasContent[x] = true; }
+    }
+  }
+  const top = rowHasContent.indexOf(true), bottom = rowHasContent.lastIndexOf(true);
+  const left = colHasContent.indexOf(true), right = colHasContent.lastIndexOf(true);
+  if (top < 0 || left < 0 || bottom <= top || right <= left) return null;
+  const gainedFrac = 1 - ((right - left + 1) * (bottom - top + 1)) / (sw * sh);
+  if (gainedFrac < 0.02) return null; // pas assez de bande noire pour que ça vaille le coup
+  return { x: left / sw, y: top / sh, w: (right - left + 1) / sw, h: (bottom - top + 1) / sh };
+}
+
+// Convertit un rect normalisé (espace vidéo source) <-> position CSS sur
+// l'aperçu, qui affiche la vidéo en object-fit:contain (donc avec ses
+// propres marges si le ratio ne correspond pas exactement à la fenêtre).
+function cropPreviewGeometry() {
+  const vw = cropPreviewVideo.videoWidth, vh = cropPreviewVideo.videoHeight;
+  const boxW = cropPreviewWrap.clientWidth, boxH = cropPreviewWrap.clientHeight;
+  if (!vw || !vh || !boxW || !boxH) return null;
+  const scale = Math.min(boxW / vw, boxH / vh);
+  const dispW = vw * scale, dispH = vh * scale;
+  return { offX: (boxW - dispW) / 2, offY: (boxH - dispH) / 2, dispW, dispH };
+}
+function showCropRect(norm) {
+  const geo = cropPreviewGeometry();
+  if (!norm || !geo) { cropRectEl.style.display = 'none'; return; }
+  cropRectEl.style.display = 'block';
+  cropRectEl.style.left = (geo.offX + norm.x * geo.dispW) + 'px';
+  cropRectEl.style.top = (geo.offY + norm.y * geo.dispH) + 'px';
+  cropRectEl.style.width = (norm.w * geo.dispW) + 'px';
+  cropRectEl.style.height = (norm.h * geo.dispH) + 'px';
+}
+function overlayPxToNormRect(x0, y0, x1, y1) {
+  const geo = cropPreviewGeometry();
+  if (!geo) return { x: 0, y: 0, w: 0, h: 0 };
+  const clamp01 = (v) => Math.max(0, Math.min(1, v));
+  const nx0 = clamp01((Math.min(x0, x1) - geo.offX) / geo.dispW);
+  const ny0 = clamp01((Math.min(y0, y1) - geo.offY) / geo.dispH);
+  const nx1 = clamp01((Math.max(x0, x1) - geo.offX) / geo.dispW);
+  const ny1 = clamp01((Math.max(y0, y1) - geo.offY) / geo.dispH);
+  return { x: nx0, y: ny0, w: Math.max(0, nx1 - nx0), h: Math.max(0, ny1 - ny0) };
+}
+
+// Affiche l'aperçu du partage brut avec un rectangle de sélection glissable ;
+// se résout avec le rect normalisé choisi (ou null = image entière).
+function openCropOverlay() {
+  return new Promise((resolve) => {
+    let currentRect = null, dragging = false, dragStartX = 0, dragStartY = 0;
+    cropRectEl.style.display = 'none';
+    cropOverlay.classList.remove('hidden');
+
+    // essaie une détection auto dès l'ouverture, pour un résultat correct
+    // par défaut si la personne clique directement sur "Valider"
+    currentRect = detectContentBounds(cropSourceVideo);
+    showCropRect(currentRect);
+
+    function onPointerDown(e) {
+      dragging = true;
+      const rect = cropPreviewWrap.getBoundingClientRect();
+      dragStartX = e.clientX - rect.left;
+      dragStartY = e.clientY - rect.top;
+    }
+    function onPointerMove(e) {
+      if (!dragging) return;
+      const rect = cropPreviewWrap.getBoundingClientRect();
+      const x = e.clientX - rect.left, y = e.clientY - rect.top;
+      cropRectEl.style.display = 'block';
+      cropRectEl.style.left = Math.min(dragStartX, x) + 'px';
+      cropRectEl.style.top = Math.min(dragStartY, y) + 'px';
+      cropRectEl.style.width = Math.abs(x - dragStartX) + 'px';
+      cropRectEl.style.height = Math.abs(y - dragStartY) + 'px';
+    }
+    function onPointerUp(e) {
+      if (!dragging) return;
+      dragging = false;
+      const rect = cropPreviewWrap.getBoundingClientRect();
+      const x = e.clientX - rect.left, y = e.clientY - rect.top;
+      const norm = overlayPxToNormRect(dragStartX, dragStartY, x, y);
+      if (norm.w < 0.02 || norm.h < 0.02) { currentRect = null; cropRectEl.style.display = 'none'; }
+      else currentRect = norm;
+    }
+    cropPreviewWrap.addEventListener('pointerdown', onPointerDown);
+    cropPreviewWrap.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+
+    cropAutoBtn.onclick = () => {
+      const bounds = detectContentBounds(cropSourceVideo);
+      currentRect = bounds;
+      showCropRect(bounds);
+      setStatus(bounds ? 'Bandes noires détectées et retirées.' : "Pas de bande noire détectée : l'image entière sera partagée.");
+    };
+    cropResetBtn.onclick = () => { currentRect = null; showCropRect(null); };
+
+    cropConfirmBtn.onclick = () => {
+      cropPreviewWrap.removeEventListener('pointerdown', onPointerDown);
+      cropPreviewWrap.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
+      cropAutoBtn.onclick = null;
+      cropResetBtn.onclick = null;
+      cropConfirmBtn.onclick = null;
+      cropOverlay.classList.add('hidden');
+      resolve(currentRect);
+    };
+  });
+}
+
+// Construit le flux réellement envoyé : soit le flux brut tel quel (pas de
+// rognage choisi), soit un flux vidéo composé image par image sur un canvas
+// caché (juste la zone choisie), avec l'audio du partage rattaché tel quel.
+function buildCroppedStream(rawStream, norm) {
+  if (!norm) return rawStream;
+
+  const vw = cropSourceVideo.videoWidth || 1280, vh = cropSourceVideo.videoHeight || 720;
+  const sx = Math.round(norm.x * vw), sy = Math.round(norm.y * vh);
+  const sw = Math.max(2, Math.round(norm.w * vw)), sh = Math.max(2, Math.round(norm.h * vh));
+
+  cropCanvasOut.width = sw;
+  cropCanvasOut.height = sh;
+  const ctx = cropCanvasOut.getContext('2d');
+
+  cropLoopActive = true;
+  (function draw() {
+    if (!cropLoopActive) return;
+    try { ctx.drawImage(cropSourceVideo, sx, sy, sw, sh, 0, 0, sw, sh); } catch (e) {}
+    screenCropAnimId = requestAnimationFrame(draw);
+  })();
+
+  const outStream = cropCanvasOut.captureStream(30);
+  rawStream.getAudioTracks().forEach((t) => outStream.addTrack(t));
+  return outStream;
+}
+
 shareBtn.onclick = async () => {
   if (sharing) { stopScreenShare(); return; }
   if (videoLinkMode) stopSharedVideo();
 
   // always fully stop any previous screen stream before requesting a new one,
   // so the browser never shows more than one "sharing this tab" indicator.
+  if (rawScreenStream) { rawScreenStream.getTracks().forEach(t => t.stop()); rawScreenStream = null; }
   if (localScreenStream) { localScreenStream.getTracks().forEach(t => t.stop()); localScreenStream = null; }
 
   if (!navigator.mediaDevices?.getDisplayMedia) {
@@ -1259,27 +1503,44 @@ shareBtn.onclick = async () => {
     return;
   }
 
+  let stream;
   try {
-    const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
-    localScreenStream = stream;
-    sharing = true;
-    shareBtn.textContent = 'Arrêter le partage';
-    shareBtn.classList.add('active');
-    shareBadge.classList.add('visible');
-
-    // local self-preview, muted (see refreshScreenDisplay) to avoid the
-    // echo of hearing your own shared tab twice
-    refreshScreenDisplay();
-
-    // catches the browser's own native "Stop sharing" button too
-    stream.getVideoTracks()[0].onended = () => stopScreenShare();
-
-    if (pc) {
-      getT(MID_SCREEN_VIDEO)?.sender.replaceTrack(stream.getVideoTracks()[0] || null);
-      getT(MID_SCREEN_AUDIO)?.sender.replaceTrack(stream.getAudioTracks()[0] || null);
-    }
+    stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
   } catch (e) {
     setStatus('Partage annulé.');
+    return;
+  }
+  rawScreenStream = stream;
+  stream.getVideoTracks()[0].onended = () => stopScreenShare(); // catches the browser's own native "Stop sharing" button too
+
+  cropSourceVideo.srcObject = stream;
+  cropPreviewVideo.srcObject = stream;
+  safePlay(cropSourceVideo);
+  safePlay(cropPreviewVideo);
+  // laisse le temps à videoWidth/videoHeight d'être connus avant d'ouvrir le cadrage
+  await new Promise((resolve) => {
+    if (cropSourceVideo.videoWidth) { resolve(); return; }
+    cropSourceVideo.onloadedmetadata = () => resolve();
+    setTimeout(resolve, 800);
+  });
+
+  const norm = await openCropOverlay();
+  cropPreviewVideo.srcObject = null;
+  const finalStream = buildCroppedStream(stream, norm);
+  localScreenStream = finalStream;
+
+  sharing = true;
+  shareBtn.textContent = 'Arrêter le partage';
+  shareBtn.classList.add('active');
+  shareBadge.classList.add('visible');
+
+  // local self-preview, muted (see refreshScreenDisplay) to avoid the
+  // echo of hearing your own shared tab twice
+  refreshScreenDisplay();
+
+  if (pc) {
+    getT(MID_SCREEN_VIDEO)?.sender.replaceTrack(finalStream.getVideoTracks()[0] || null);
+    getT(MID_SCREEN_AUDIO)?.sender.replaceTrack(finalStream.getAudioTracks()[0] || null);
   }
 };
 

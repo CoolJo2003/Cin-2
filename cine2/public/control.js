@@ -71,9 +71,15 @@
       return;
     }
     if (msg.kind === 'key') {
-      const target = document.activeElement || document.body;
-      ['keydown', 'keyup'].forEach((type) => {
-        target.dispatchEvent(new KeyboardEvent(type, { key: msg.key, code: msg.code, bubbles: true, cancelable: true }));
+      // beaucoup de lecteurs (Netflix, YouTube...) écoutent les raccourcis
+      // au niveau du document plutôt que sur un élément précisément focus,
+      // donc on envoie l'évènement aux deux pour maximiser les chances que
+      // ça marche quel que soit le site.
+      const targets = new Set([document.activeElement || document.body, document, document.body]);
+      targets.forEach((target) => {
+        ['keydown', 'keyup'].forEach((type) => {
+          target.dispatchEvent(new KeyboardEvent(type, { key: msg.key, code: msg.code, bubbles: true, cancelable: true }));
+        });
       });
     }
   }
